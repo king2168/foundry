@@ -79,10 +79,12 @@ network's execution semantics.
 
 After dispatch, `SpecFor<FEN>` owns hardfork resolution through `ExecutionSpec`: checked
 namespaced conversion, native source-chain schedules, local-fork behavior, and metadata for direct
-spec overrides. The shared resolver accepts one typed explicit spec and derives its reported
-hardfork from that same value. Tracing carries the result, including absent metadata for an
-Ethereum or Optimism version override, directly into decoding. Keep the source chain ID separate
-from an overridden execution chain ID when supplying historical context.
+spec overrides. Script forks follow an Ethereum source chain that is ahead of `evm_version`,
+because the script simulation sets broadcast gas limits. The shared resolver accepts one typed
+explicit spec and derives its reported hardfork from that same value. Tracing carries the result,
+including absent metadata for an Ethereum or Optimism version override, directly into decoding.
+Keep the source chain ID separate from an overridden execution chain ID when supplying historical
+context.
 
 Do not encode protocol behavior only as a chain-ID branch in a tool. Put execution semantics in the
 network factory or context, selection in the network configuration layer, and tool-specific workflow
@@ -244,6 +246,24 @@ Use a layered test plan:
 
 Keep feature propagation synchronized across workspace manifests, the root `Makefile`, and the
 release and Docker workflows. Tests that use forks must contain `fork` in their names.
+
+### Tempo certificate and storage proofs
+
+On Unix, the [Forge test](../../crates/forge/tests/cli/tempo_proofs.rs) verifies fresh Anvil certificates,
+key rotation and account/storage proofs in Solidity, including a local two-node fork pinned to a
+fixed upstream height. It deploys and updates a contract on the fork, then checks that late upstream
+reads and later writes preserve the earlier certified proofs. It also writes to an upstream account
+and verifies its inclusion in a later sealed partial trie while preserving its earlier exclusion.
+Uncached runs download pinned sources and Solc.
+
+Fork certificates authenticate the sealed trie of cached local state, not the complete upstream
+state. An uncached upstream account remains absent from an earlier sealed trie even after a later
+RPC read loads it. The fork uses an explicit local development consensus identity distinct from the
+upstream identity; this test does not authenticate an upstream committee handoff to that local key.
+
+```sh
+cargo nextest run -p forge --test cli tempo_proofs
+```
 
 ## Documentation and releases
 

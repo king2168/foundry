@@ -40,6 +40,7 @@ use std::{
     fs::File,
     io::BufReader,
     path::Path,
+    sync::Arc,
 };
 
 /// Number of preceding block hashes available to the EVM's `BLOCKHASH` opcode.
@@ -67,7 +68,7 @@ pub(crate) fn cache_block_hash(block_hashes: &mut U256Map<B256>, number: U256, h
 }
 
 /// Helper trait get access to the full state data of the database
-pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
+pub trait MaybeFullDatabase: crate::mem::DatabaseRef + Send + Sync {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         None
     }
@@ -79,6 +80,11 @@ pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
     /// Returns an owned, recursively merged view of all available accounts.
     fn maybe_full_db(&self) -> Option<AddressMap<DbAccount>> {
         self.maybe_as_full_db().cloned()
+    }
+
+    /// Returns the accounts if they are stored behind a shared, immutable allocation.
+    fn maybe_shared_full_db(&self) -> Option<Arc<AddressMap<DbAccount>>> {
+        None
     }
 
     /// Returns whether snapshots of this database use structural sharing.
@@ -100,6 +106,9 @@ pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
     /// Reverses `clear_into_snapshot` by initializing the db's state with the state snapshot.
     fn init_from_state_snapshot(&mut self, state_snapshot: StateSnapshot);
 }
+
+/// A borrowed, type-erased state that overlays are built on, so that EVMs are monomorphized once.
+pub type StateRef<'a> = &'a dyn MaybeFullDatabase;
 
 impl<'a, T: 'a + MaybeFullDatabase + ?Sized> MaybeFullDatabase for &'a T
 where
@@ -144,6 +153,10 @@ where
 
     fn maybe_full_db(&self) -> Option<AddressMap<DbAccount>> {
         T::maybe_full_db(self)
+    }
+
+    fn maybe_shared_full_db(&self) -> Option<Arc<AddressMap<DbAccount>>> {
+        T::maybe_shared_full_db(self)
     }
 
     fn is_persistent(&self) -> bool {
@@ -422,6 +435,13 @@ pub trait Db:
 
     /// Returns the current, standalone state of the Db
     fn current_state(&self) -> StateDb;
+
+    /// Rebuilds a historical state from a serialized state snapshot.
+    fn historical_state(&self, state_snapshot: StateSnapshot) -> StateDb {
+        let mut state = StateDb::new(MemDb::default());
+        state.init_from_state_snapshot(state_snapshot);
+        state
+    }
 }
 
 /// Convenience impl only used to use any `Db` on the fly as the db layer for revm's CacheDB
@@ -510,30 +530,50 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
         let db_accounts = std::mem::take(&mut self.cache.accounts);
         let mut accounts = HashMap::default();
         let mut account_storage = HashMap::default();
+        let mut account_states = HashMap::default();
 
         for (addr, mut acc) in db_accounts {
             account_storage.insert(addr, std::mem::take(&mut acc.storage));
+            if matches!(acc.account_state, AccountState::NotExisting | AccountState::StorageCleared)
+            {
+                account_states.insert(addr, acc.account_state);
+            }
             let mut info = acc.info;
             info.code = self.cache.contracts.remove(&info.code_hash());
             accounts.insert(addr, info);
         }
         let block_hashes = std::mem::take(&mut self.cache.block_hashes);
-        StateSnapshot { accounts, storage: account_storage, block_hashes }
+        StateSnapshot {
+            accounts,
+            storage: account_storage,
+            block_hashes,
+            account_states: Some(account_states),
+        }
     }
 
     fn read_as_state_snapshot(&self) -> StateSnapshot {
         let mut accounts = HashMap::default();
         let mut account_storage = HashMap::default();
+        let mut account_states = HashMap::default();
 
         for (addr, acc) in &self.cache.accounts {
             account_storage.insert(*addr, acc.storage.clone());
+            if matches!(acc.account_state, AccountState::NotExisting | AccountState::StorageCleared)
+            {
+                account_states.insert(*addr, acc.account_state.clone());
+            }
             let mut info = acc.info.clone();
             info.code = self.cache.contracts.get(&info.code_hash()).cloned();
             accounts.insert(*addr, info);
         }
 
         let block_hashes = self.cache.block_hashes.clone();
-        StateSnapshot { accounts, storage: account_storage, block_hashes }
+        StateSnapshot {
+            accounts,
+            storage: account_storage,
+            block_hashes,
+            account_states: Some(account_states),
+        }
     }
 
     fn clear(&mut self) {
@@ -541,7 +581,8 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
     }
 
     fn init_from_state_snapshot(&mut self, state_snapshot: StateSnapshot) {
-        let StateSnapshot { accounts, mut storage, block_hashes } = state_snapshot;
+        let StateSnapshot { accounts, mut storage, block_hashes, account_states } = state_snapshot;
+        let mut account_states = account_states.unwrap_or_default();
 
         for (addr, mut acc) in accounts {
             if let Some(code) = acc.code.take() {
@@ -551,8 +592,8 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
                 addr,
                 DbAccount {
                     info: acc,
+                    account_state: account_states.remove(&addr).unwrap_or_default(),
                     storage: storage.remove(&addr).unwrap_or_default(),
-                    ..Default::default()
                 },
             );
         }
@@ -590,10 +631,10 @@ impl<T: DatabaseRef<Error = DatabaseError>> MaybeForkedDatabase for CacheDB<T> {
 
 /// Represents a state at certain point
 #[derive(Debug)]
-pub struct StateDb(pub(crate) Box<dyn MaybeFullDatabase + Send + Sync>);
+pub struct StateDb(pub(crate) Box<dyn MaybeFullDatabase>);
 
 impl StateDb {
-    pub fn new(db: impl MaybeFullDatabase + Send + Sync + 'static) -> Self {
+    pub fn new(db: impl MaybeFullDatabase + 'static) -> Self {
         Self(Box::new(db))
     }
 
@@ -630,6 +671,10 @@ impl MaybeFullDatabase for StateDb {
 
     fn maybe_full_db(&self) -> Option<AddressMap<DbAccount>> {
         self.0.maybe_full_db()
+    }
+
+    fn maybe_shared_full_db(&self) -> Option<Arc<AddressMap<DbAccount>>> {
+        self.0.maybe_shared_full_db()
     }
 
     fn is_persistent(&self) -> bool {
@@ -984,6 +1029,7 @@ mod test {
     use super::*;
     use crate::eth::backend::mem::fork_db::ForkedDatabase;
     use alloy_consensus::Header;
+    use alloy_eips::eip4895::Withdrawal;
     use alloy_network::AnyNetwork;
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
@@ -1060,6 +1106,49 @@ mod test {
     }
 
     #[test]
+    fn cache_db_state_snapshot_preserves_account_states() {
+        let touched = Address::with_last_byte(1);
+        let deleted = Address::with_last_byte(2);
+        let cleared = Address::with_last_byte(3);
+        let (kept_slot, missing_slot) = (U256::ONE, U256::from(2));
+        // The base stands in for a fork whose storage must not leak into cleared accounts.
+        let base = || {
+            let mut base = MemDb::default();
+            for address in [touched, deleted, cleared] {
+                base.insert_account(address, AccountInfo::from_balance(U256::ONE));
+                base.set_storage_at(address, missing_slot.into(), B256::with_last_byte(9)).unwrap();
+            }
+            base
+        };
+
+        let mut cache = CacheDB::new(base());
+        cache.insert_account_storage(touched, kept_slot, U256::from(5)).unwrap();
+        cache.cache.accounts.insert(deleted, DbAccount::new_not_existing());
+        let mut cleared_account = DbAccount {
+            info: AccountInfo::from_balance(U256::from(40)),
+            account_state: AccountState::StorageCleared,
+            ..Default::default()
+        };
+        cleared_account.storage.insert(kept_slot, U256::from(6));
+        cache.cache.accounts.insert(cleared, cleared_account);
+
+        let snapshot = cache.read_as_state_snapshot();
+        let mut restored = CacheDB::new(base());
+        restored.init_from_state_snapshot(
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap(),
+        );
+
+        assert_eq!(restored.storage_ref(touched, kept_slot).unwrap(), U256::from(5));
+        assert_eq!(restored.storage_ref(touched, missing_slot).unwrap(), U256::from(9));
+        assert_eq!(restored.basic_ref(deleted).unwrap(), None);
+        assert_eq!(restored.storage_ref(deleted, missing_slot).unwrap(), U256::ZERO);
+        assert_eq!(restored.basic_ref(cleared).unwrap().unwrap().balance, U256::from(40));
+        assert_eq!(restored.storage_ref(cleared, kept_slot).unwrap(), U256::from(6));
+        assert_eq!(restored.storage_ref(cleared, missing_slot).unwrap(), U256::ZERO);
+        assert_eq!(restored.clear_into_state_snapshot().account_states, snapshot.account_states);
+    }
+
+    #[test]
     fn test_deser_block() {
         let block = r#"{
             "header": {
@@ -1109,8 +1198,6 @@ mod test {
 
     #[test]
     fn test_block_withdrawals_preserved() {
-        use alloy_eips::eip4895::Withdrawal;
-
         // create a block with withdrawals (like post-Shanghai blocks)
         let withdrawal = Withdrawal {
             index: 42,

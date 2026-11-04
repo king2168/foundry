@@ -1,8 +1,9 @@
 use super::{
     multi_sequence::MultiChainSequence,
     providers::{ProviderInfo, ProvidersManager},
+    recovery::RecoveryStore,
     runner::ScriptRunner,
-    sequence::ScriptSequenceKind,
+    sequence::{ScriptSequenceKind, SequenceData},
     transaction::ScriptTransactionBuilder,
 };
 use crate::{
@@ -158,6 +159,7 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
                 if to.is_some() {
                     builder.set_call(
                         &address_to_abi,
+                        &self.build_data.known_contracts,
                         decoder,
                         self.script_config.evm_opts.create2_deployer,
                     )?;
@@ -165,7 +167,7 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
                     builder.set_create(
                         false,
                         tx.contract_address.unwrap_or_else(|| sender.create(nonce)),
-                        &address_to_abi,
+                        &self.build_data.known_contracts,
                     )?;
                 }
 
@@ -178,8 +180,21 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
 
     fn into_filled(
         self,
-        transactions: VecDeque<TransactionWithMetadata<FEN::Network>>,
+        mut transactions: VecDeque<TransactionWithMetadata<FEN::Network>>,
     ) -> FilledTransactionsState<FEN> {
+        // Use the final script labels, including labels set after a deployment. Additional
+        // contracts are only known after transaction simulation.
+        let labels = &self.execution_result.labeled_addresses;
+        for transaction in &mut transactions {
+            if transaction.call_kind.is_any_create() {
+                transaction.label =
+                    transaction.contract_address.and_then(|address| labels.get(&address)).cloned();
+            }
+            for contract in &mut transaction.additional_contracts {
+                contract.label = labels.get(&contract.address).cloned();
+            }
+        }
+
         FilledTransactionsState {
             args: self.args,
             script_config: self.script_config,
@@ -288,13 +303,18 @@ impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
                     )?;
 
                     // Only prompt if we're broadcasting and we've not disabled interactivity.
-                    if self.args.should_broadcast()
-                        && !self.args.non_interactive
-                        && !Confirm::new()
+                    if self.args.should_broadcast() && !self.args.non_interactive {
+                        if !dialoguer::console::Term::stderr().is_term() {
+                            eyre::bail!(
+                                "transaction to {to} has no code; pass --non-interactive to continue without confirmation"
+                            );
+                        }
+                        if !Confirm::new()
                             .with_prompt("Do you wish to continue?".to_string())
                             .interact()?
-                    {
-                        eyre::bail!("User canceled the script.");
+                        {
+                            eyre::bail!("User canceled the script.");
+                        }
                     }
                 }
 
@@ -743,23 +763,22 @@ impl<FEN: FoundryEvmNetwork> FilledTransactionsState<FEN> {
             }
         }
 
-        let sequence = if sequences.len() == 1 {
-            ScriptSequenceKind::new_single(
-                sequences.pop().expect("empty sequences"),
-                self.args.batch,
-            )?
+        let data = if sequences.len() == 1 {
+            SequenceData::Single(Box::new(sequences.pop().expect("empty sequences")))
         } else {
-            ScriptSequenceKind::new_multi(
-                MultiChainSequence::new(
-                    sequences,
-                    &self.args.sig,
-                    &self.build_data.build_data.target,
-                    &self.script_config.config,
-                    !self.args.broadcast,
-                )?,
-                self.args.batch,
-            )?
+            SequenceData::Multi(MultiChainSequence::new(
+                sequences,
+                &self.args.sig,
+                &self.build_data.build_data.target,
+                &self.script_config.config,
+                !self.args.broadcast,
+            )?)
         };
+        if self.args.start_fresh {
+            RecoveryStore::<FEN::Network>::archive_unfinished(&data)?;
+        }
+        let sequence =
+            ScriptSequenceKind::create(data, self.args.batch, self.script_config.tempo.sponsor)?;
 
         Ok(BundledState {
             args: self.args,
@@ -768,6 +787,7 @@ impl<FEN: FoundryEvmNetwork> FilledTransactionsState<FEN> {
             browser_wallet: self.browser_wallet,
             build_data: self.build_data,
             sequence,
+            resume_script_error: None,
         })
     }
 
@@ -825,6 +845,7 @@ impl<FEN: FoundryEvmNetwork> FilledTransactionsState<FEN> {
             chain,
             commit,
             recovery_generation: None,
+            reverted: vec![],
         };
         Ok(sequence)
     }

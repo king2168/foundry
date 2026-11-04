@@ -231,7 +231,7 @@ impl ScriptProgress {
         let futs = pending
             .iter()
             .filter(|hash| !blocked_hashes.contains(hash))
-            .map(|&tx| check_tx_status(provider, tx, timeout, confirmations));
+            .map(|&tx| check_tx_status(provider, tx, timeout, confirmations, &self.multi));
         let mut tasks = Some(futures::stream::iter(futs).buffer_unordered(10));
         let mut polled = Vec::with_capacity(count);
         let mut unpolled = None;
@@ -325,11 +325,11 @@ impl ScriptProgress {
                     deployment_sequence.add_receipt(receipt);
                 }
                 Ok(TxStatus::Revert(receipt)) => {
-                    // consider:
-                    // if this is not removed from pending, then the script becomes
-                    // un-resumable. Is this desirable on reverts?
                     warn!(tx_hash=?tx_hash, "Transaction Failure");
                     deployment_sequence.remove_pending(receipt.transaction_hash());
+                    if !deployment_sequence.reverted.contains(&tx_hash) {
+                        deployment_sequence.reverted.push(tx_hash);
+                    }
 
                     let msg = format_receipt(
                         deployment_sequence.chain.into(),

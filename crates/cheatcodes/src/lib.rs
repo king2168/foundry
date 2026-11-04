@@ -23,7 +23,10 @@ use foundry_evm_core::{
     evm::{FoundryContextFor, FoundryEvmNetwork, SpecFor},
     fork::CreateFork,
 };
-use revm::context::{Block, Cfg, ContextTr, JournalTr, Transaction};
+use revm::{
+    context::{Block, Cfg, ContextTr, JournalTr, Transaction},
+    interpreter::Gas,
+};
 
 pub use Vm::ForgeContext;
 pub use config::CheatsConfig;
@@ -75,7 +78,10 @@ mod string;
 mod tempo;
 
 mod test;
-pub use test::expect::ExpectedCallTracker;
+pub use test::{
+    expect::ExpectedCallTracker,
+    revert_handlers::{DUMMY_CALL_OUTPUT, DUMMY_CREATE_ADDRESS},
+};
 
 mod toml;
 
@@ -127,8 +133,8 @@ pub struct CheatsCtxt<'a, 'db, FEN: FoundryEvmNetwork> {
     pub(crate) ecx: &'a mut FoundryContextFor<'db, FEN>,
     /// The original `msg.sender`.
     pub(crate) caller: Address,
-    /// Gas limit of the current cheatcode call.
-    pub(crate) gas_limit: u64,
+    /// Gas of the current cheatcode call, returned to the caller.
+    pub(crate) gas: &'a mut Gas,
     /// Whether the current cheatcode call is static.
     pub(crate) is_static: bool,
 }
